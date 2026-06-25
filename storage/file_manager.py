@@ -29,10 +29,14 @@ def chapter_exists(base_dir: Path, novel_name: str, chapter_num: int) -> bool:
     if not novel_dir.exists():
         return False
     prefix = f"{chapter_num:03d}_"
-    return any(d.name.startswith(prefix) for d in novel_dir.iterdir() if d.is_dir())
+    try:
+        return any(d.name.startswith(prefix) for d in novel_dir.iterdir() if d.is_dir())
+    except FileNotFoundError:
+        return False
 
 
 def _sanitize(name: str) -> str:
     for ch in r'\/:*?"<>|':
         name = name.replace(ch, "_")
-    return name.strip()
+    name = name.strip()
+    return name if name else "unnamed"
