@@ -162,17 +162,16 @@ class NovelPiaClient:
         ]
 
     def get_chapter_list(self, novel_id: str) -> list[ChapterInfo]:
+        """EP.0(첫 화)부터 '다음화 보기' 링크를 따라 전체 화 목록을 구성한다.
+        화 제목에 숫자가 없어도 순서가 보장되고 페이지네이션 문제도 없다."""
+        import time as _time
         page = self._session.page
-        url = f"{BASE_URL}/novel/{novel_id}"
 
+        # 1. 소설 페이지에서 첫 화 URL 찾기
         try:
-            page.goto(url, wait_until="commit", timeout=15_000)
+            page.goto(f"{BASE_URL}/novel/{novel_id}", wait_until="commit", timeout=15_000)
         except Exception:
-            try:
-                page.evaluate("u => { window.location.href = u; }", url)
-            except Exception:
-                pass
-
+            pass
         try:
             page.wait_for_load_state("domcontentloaded", timeout=15_000)
         except Exception:
@@ -182,59 +181,204 @@ class NovelPiaClient:
         except Exception:
             pass
 
-        # JS로 /viewer/ 링크를 직접 추출 — CSS 선택자보다 HTML 구조에 독립적
+        # 에피소드 목록이 로드될 때까지 추가 대기 (댓글보다 늦게 로드되는 경우)
         try:
-            raw: list[dict] = page.evaluate("""
-                () => {
-                    const seen = new Set();
-                    const results = [];
-                    document.querySelectorAll('a[href]').forEach(a => {
-                        if (!a.href.includes('/viewer/')) return;
-                        if (seen.has(a.href)) return;
-                        seen.add(a.href);
-
-                        // 부모 카드에서 제목 요소 탐색
-                        let title = '';
-                        const card = a.closest('li, tr, .item, .episode-item') || a.parentElement;
-                        if (card) {
-                            const titleEl = card.querySelector(
-                                '[class*="title"], [class*="ep_title"], [class*="episode_title"],'
-                                + '[class*="ep-title"], [class*="subject"], .s_inv_bold'
-                            );
-                            if (titleEl) title = titleEl.textContent.trim().slice(0, 60);
-                        }
-
-                        // 제목 없으면 링크 텍스트에서 N화 패턴 추출
-                        if (!title) {
-                            const raw = a.textContent.replace(/[\\n\\r\\t]/g, ' ').trim();
-                            const m = raw.match(/\\d+\\s*화/);
-                            title = m ? m[0].replace(/\\s+/g, '') : raw.slice(0, 60);
-                        }
-
-                        results.push({ url: a.href, title });
-                    });
-                    return results;
-                }
-            """) or []
-        except Exception:
-            raw = []
-
-        import re as _re
-
-        def _ep_num(item: dict) -> int:
-            m = _re.search(r"(\d+)화", item.get("title", ""))
-            return int(m.group(1)) if m else 9999
-
-        raw.sort(key=_ep_num)
-
-        return [
-            ChapterInfo(
-                chapter_num=_ep_num(item) if _ep_num(item) != 9999 else i + 1,
-                title=item.get("title", f"{i + 1}화") or f"{i + 1}화",
-                url=item["url"],
+            page.wait_for_function(
+                "() => /EP\\.?\\s*\\d+/i.test(document.body.innerText)",
+                timeout=8_000,
             )
-            for i, item in enumerate(raw)
-        ]
+        except Exception:
+            _time.sleep(2)
+
+        # 에피소드 목록이 화면 밖에 있을 경우 스크롤로 로드 유도
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight / 3)")
+            _time.sleep(0.5)
+            page.evaluate("window.scrollTo(0, 0)")
+            _time.sleep(0.3)
+        except Exception:
+            pass
+
+        # 첫 화 URL 찾기: EP.0 라벨 기반 (공지사항과 구별하기 위해 EP 번호 직접 탐색)
+        first_url: str | None = None
+
+        # 디버그: EP.N 텍스트 여부와 링크 구조 파악
+        debug_info: dict = page.evaluate("""
+            () => {
+                const bodyText = document.body.innerText;
+                const hasEP0 = /EP\\.?\\s*0/i.test(bodyText);
+
+                // EP.N 텍스트가 있는 카드에서 모든 링크 수집
+                const allAnchors = [...document.querySelectorAll('a[href]')];
+                const epAnchors = allAnchors.filter(a => {
+                    const card = a.closest('li,tr,article,div,[class*="ep"]') || a.parentElement;
+                    return card && /EP\\.?\\s*\\d+/i.test(card.textContent);
+                });
+
+                // viewer 링크 (기존)
+                const viewerLinks = [...document.querySelectorAll('a[href*="/viewer/"]')];
+
+                return {
+                    hasEP0,
+                    viewerCount: viewerLinks.length,
+                    epAnchorCount: epAnchors.length,
+                    epSamples: epAnchors.slice(0,5).map(a => ({
+                        href: a.href.slice(-30),
+                        text: a.textContent.trim().slice(0,50)
+                    })),
+                    viewerSamples: viewerLinks.slice(0,3).map(a => ({
+                        href: a.href.slice(-20),
+                        text: (a.closest('li,div') || a).textContent.replace(/\\s+/g,' ').trim().slice(0,60)
+                    }))
+                };
+            }
+        """) or {}
+        print(f"[DEBUG] hasEP0={debug_info.get('hasEP0')}, viewerLinks={debug_info.get('viewerCount')}, epAnchors={debug_info.get('epAnchorCount')}")
+        print(f"[DEBUG] EP anchors:")
+        for item in debug_info.get('epSamples', []):
+            print(f"  href=...{item['href']}  text={item['text']!r}")
+        print(f"[DEBUG] viewer links:")
+        for item in debug_info.get('viewerSamples', []):
+            print(f"  href=...{item['href']}  text={item['text']!r}")
+
+        # 전략 1: 카드 텍스트에 'EP.0' 패턴이 있는 viewer 링크
+        first_url = page.evaluate("""
+            () => {
+                const links = [...document.querySelectorAll('a[href*="/viewer/"]')];
+                for (const a of links) {
+                    const card = a.closest('li,tr,article,[class*="episode"],[class*="ep_"]')
+                                 || a.parentElement;
+                    const text = card ? card.textContent : a.textContent;
+                    if (/EP\\.?\\s*0(?!\\d)/i.test(text)) return a.href;
+                }
+                return null;
+            }
+        """)
+        print(f"[DEBUG] Strategy1 (EP.0 card text): {first_url}")
+
+        # 전략 2: 모든 EP.N 라벨 파싱 → 번호가 가장 작은 화
+        if not first_url:
+            result2: dict = page.evaluate("""
+                () => {
+                    const links = [...document.querySelectorAll('a[href*="/viewer/"]')];
+                    let minEp = Infinity, minHref = null;
+                    for (const a of links) {
+                        const card = a.closest('li,tr,article,[class*="episode"],[class*="ep_"]')
+                                     || a.parentElement;
+                        const text = card ? card.textContent : a.textContent;
+                        const m = text.match(/EP\\s*\\.?\\s*(\\d+)/i);
+                        if (m) {
+                            const ep = parseInt(m[1]);
+                            if (ep < minEp) { minEp = ep; minHref = a.href; }
+                        }
+                    }
+                    return { href: minHref, ep: minEp === Infinity ? null : minEp };
+                }
+            """) or {}
+            first_url = result2.get('href')
+            print(f"[DEBUG] Strategy2 (min EP): ep={result2.get('ep')} url={first_url}")
+
+        # 전략 3: '첫화' 텍스트 링크
+        if not first_url:
+            first_url = page.evaluate("""
+                () => {
+                    const a = [...document.querySelectorAll('a')]
+                        .find(el => el.textContent.replace(/\\s+/g,'').includes('첫화')
+                               && el.href && el.href.includes('/viewer/'));
+                    return a ? a.href : null;
+                }
+            """)
+
+        # 전략 4: viewer 링크 중 하나를 잡아 '이전화' 체인으로 거슬러 올라감
+        if not first_url:
+            any_url: str | None = page.evaluate("""
+                () => {
+                    const links = [...document.querySelectorAll('a[href*="/viewer/"]')];
+                    return links.length > 0 ? links[0].href : null;
+                }
+            """)
+            if any_url:
+                current = any_url
+                for _ in range(1000):
+                    try:
+                        page.goto(current, wait_until="commit", timeout=10_000)
+                        page.wait_for_load_state("domcontentloaded", timeout=8_000)
+                    except Exception:
+                        break
+                    _time.sleep(0.2)
+                    prev: str | None = page.evaluate("""
+                        () => {
+                            const a = [...document.querySelectorAll('a[href*="/viewer/"]')].find(el => {
+                                const t = el.textContent.replace(/\\s+/g,'');
+                                return t.includes('이전화') || t.includes('이전편');
+                            });
+                            return a ? a.href : null;
+                        }
+                    """)
+                    if not prev:
+                        first_url = current
+                        break
+                    current = prev
+
+        if not first_url:
+            return []
+
+        # 2. 첫 화부터 '다음화 보기' 링크를 따라 전체 목록 수집
+        chapters: list[ChapterInfo] = []
+        current_url: str | None = first_url
+        num = 1
+
+        while current_url and num <= 2000:
+            try:
+                page.goto(current_url, wait_until="commit", timeout=15_000)
+            except Exception:
+                pass
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=10_000)
+            except Exception:
+                pass
+
+            # 팝업 제거 (구독 모달 등)
+            try:
+                page.keyboard.press("Escape")
+                page.evaluate("""
+                    () => document.querySelectorAll(
+                        '.modal,[class*="modal"],[class*="popup"],[class*="overlay"]'
+                    ).forEach(el => { if(el.offsetParent) el.remove(); })
+                """)
+            except Exception:
+                pass
+
+            # 뷰어 페이지에서 에피소드 제목 추출
+            title: str = page.evaluate("""
+                () => {
+                    const sel = [
+                        '.ep_title','.episode_title','[class*="ep_title"]',
+                        '[class*="episode_title"]','.s_inv_bold','h2','h1'
+                    ].join(',');
+                    const el = document.querySelector(sel);
+                    return el ? el.textContent.trim().slice(0,60) : '';
+                }
+            """) or f"{num}화"
+
+            chapters.append(ChapterInfo(chapter_num=num, title=title, url=current_url))
+
+            # 다음화 URL 추출 (클릭 없이 href만 가져옴)
+            next_url: str | None = page.evaluate("""
+                () => {
+                    const a = [...document.querySelectorAll('a[href*="/viewer/"]')].find(el => {
+                        const t = el.textContent.replace(/\\s+/g,'');
+                        return t.includes('다음화') || t.includes('다음편');
+                    });
+                    return a ? a.href : null;
+                }
+            """)
+
+            current_url = next_url
+            num += 1
+            _time.sleep(0.3)
+
+        return chapters
 
     def relogin(self) -> bool:
         if self._credentials:

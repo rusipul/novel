@@ -74,16 +74,28 @@ def main() -> None:
             )
 
     def handle_confirm_login() -> None:
-        # "② 로그인 완료" 버튼 클릭 시 — 현재 URL로 로그인 여부를 확인한다.
+        # "② 로그인 완료" 버튼 클릭 시
+        # OAuth 후 브라우저가 Naver 등 외부 페이지에 있을 수 있으므로
+        # 노벨피아 홈으로 이동해 쿠키 기반으로 로그인 상태를 재확인한다.
+        def _check():
+            import time as _t
+            page = client._session.page
+            # 노벨피아 도메인이 아니면 홈으로 이동
+            if "novelpia.com" not in page.url:
+                try:
+                    page.goto("https://novelpia.com", wait_until="domcontentloaded", timeout=15_000)
+                    _t.sleep(1)
+                except Exception:
+                    pass
+            return client.is_logged_in()
+
         try:
-            logged_in = _submit_sync(client.is_logged_in)
+            logged_in = _submit_sync(_check)
         except Exception:
             logged_in = False
 
         if logged_in:
             _login_ok[0] = True
-            # quit()은 mainloop를 멈추지만 창을 파괴하지 않음.
-            # 메인 스레드가 mainloop() 반환 후 다음 창을 직접 연다.
             login_refs["win"].after(0, login_refs["win"].quit)
         else:
             login_refs["win"].after(
