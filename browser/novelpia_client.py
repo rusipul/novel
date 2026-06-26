@@ -236,6 +236,36 @@ class NovelPiaClient:
             for i, item in enumerate(raw)
         ]
 
+    def try_auto_login(self) -> bool:
+        """저장된 세션 쿠키로 자동 로그인을 시도한다.
+        노벨피아 홈으로 이동해 로그인 상태를 확인한다."""
+        page = self._session.page
+        try:
+            page.goto(f"{BASE_URL}", wait_until="domcontentloaded", timeout=15_000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=5_000)
+            except Exception:
+                pass
+            # 로그인 상태: 유저 메뉴/마이페이지 링크 존재 여부로 판단
+            user_el = page.query_selector(
+                "a[href*='/mypage'], a[href*='/my/'], "
+                "[class*='user_name'], [class*='username'], "
+                "[class*='my_info'], [class*='myinfo'], .s_nav_my"
+            )
+            if user_el:
+                return True
+            # 로그인 버튼이 있으면 세션 만료
+            login_el = page.query_selector(
+                "a[href='/login'], a[href*='login'], .btn_login, [class*='btn-login']"
+            )
+            return login_el is None
+        except Exception:
+            return False
+
+    def save_session(self, path: str) -> None:
+        """현재 로그인 세션(쿠키)을 파일로 저장한다."""
+        self._session.save_state(path)
+
     def relogin(self) -> bool:
         if self._credentials:
             return self.login(*self._credentials)
