@@ -24,6 +24,7 @@ class NovelPiaClient:
     SEL_EMAIL = "input[name='email'], input[type='email']"
     SEL_PASSWORD = "input[name='password'], input[type='password']"
     SEL_LOGIN_BTN = "button[type='submit']"
+    SEL_NAVER_BTN = "a[href*='naver'], .btn-naver, [class*='naver-login'], img[alt*='네이버']"
     SEL_NOVEL_ITEM = ".novel-item, .book-item, [class*='novel-list'] li"
     SEL_NOVEL_TITLE = ".novel-title, .book-title, [class*='title']"
     SEL_NOVEL_AUTHOR = ".novel-author, .author, [class*='author']"
@@ -45,6 +46,26 @@ class NovelPiaClient:
         page.click(self.SEL_LOGIN_BTN)
         page.wait_for_load_state("networkidle")
         return "/login" not in page.url
+
+    def login_naver(self, timeout_ms: int = 300_000) -> bool:
+        page = self._session.page
+        page.goto(f"{BASE_URL}/login")
+        page.wait_for_load_state("networkidle")
+
+        naver_btn = page.query_selector(self.SEL_NAVER_BTN)
+        if not naver_btn:
+            return False
+        naver_btn.click()
+
+        # 사용자가 네이버 OAuth를 완료할 때까지 대기 (최대 timeout_ms)
+        try:
+            page.wait_for_url(
+                lambda url: "novelpia.com" in url and "/login" not in url,
+                timeout=timeout_ms,
+            )
+            return True
+        except Exception:
+            return False
 
     def search(self, query: str, search_type: str = "title") -> list[NovelInfo]:
         type_param = {"title": "novel", "author": "author", "tag": "tag"}.get(search_type, "novel")
@@ -87,4 +108,4 @@ class NovelPiaClient:
     def relogin(self) -> bool:
         if self._credentials:
             return self.login(*self._credentials)
-        return False
+        return False  # 소셜 로그인은 자동 재로그인 불가
