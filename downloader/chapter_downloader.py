@@ -111,8 +111,9 @@ class ChapterDownloader:
             return ""
 
     def _save_pdf(self, page, output_path: Path) -> int:
-        """GoFullPage 방식: CSS !important 주입으로 내부 스크롤 제한 해제 후
-        full_page 스크린샷 한 장으로 전체 캡처, 뷰포트 단위로 잘라 PDF 저장."""
+        """GoFullPage 방식으로 전체 챕터를 PDF로 저장한다.
+        조상 요소의 height/overflow를 모두 해제해 창 스크롤로 전환한 뒤
+        뷰포트 단위로 찍어 이어붙인다 — full_page=True 캔버스 높이 제한을 피함."""
         try:
             from PIL import Image as PILImage
         except ImportError:
@@ -125,23 +126,31 @@ class ChapterDownloader:
         try:
             vp_h = int(page.evaluate("() => window.innerHeight") or 900)
 
-            # !important CSS 주입 — 높이 고정·overflow 제한 모두 해제
-            page.add_style_tag(content="""
-                #novel_text, #novel_box, #viewer_no_drag,
-                [id^="novel_"], [class*="viewer_wrap"], [class*="novel_view"],
-                [class*="viewer-wrap"], [class*="novel-view"] {
-                    overflow: visible !important;
-                    height: auto !important;
-                    max-height: none !important;
-                    min-height: 0 !important;
-                }
-                body, html {
-                    overflow-y: visible !important;
-                    height: auto !important;
+            # 소설 컨테이너부터 body까지 모든 조상의 height/overflow 제한 해제
+            # → 내부 스크롤이 창 스크롤로 전환됨
+            page.evaluate("""
+                () => {
+                    const root = document.getElementById('novel_text')
+                               || document.getElementById('novel_box')
+                               || document.getElementById('viewer_no_drag');
+                    if (root) {
+                        let el = root;
+                        while (el && el.tagName !== 'BODY') {
+                            el.style.setProperty('overflow',   'visible', 'important');
+                            el.style.setProperty('height',     'auto',    'important');
+                            el.style.setProperty('max-height', 'none',    'important');
+                            el.style.setProperty('min-height', '0',       'important');
+                            el = el.parentElement;
+                        }
+                    }
+                    document.body.style.setProperty('overflow-y', 'visible', 'important');
+                    document.body.style.setProperty('height',     'auto',    'important');
+                    document.documentElement.style.setProperty('overflow-y', 'visible', 'important');
+                    document.documentElement.style.setProperty('height',     'auto',    'important');
                 }
             """)
 
-            # 레이아웃 재계산 완료까지 높이가 안정될 때까지 대기 (최대 3초)
+            # 레이아웃 안정화 대기 (최대 3초)
             prev_h = 0
             stable = 0
             for _ in range(30):
@@ -150,7 +159,7 @@ class ChapterDownloader:
                 )
                 if cur_h == prev_h:
                     stable += 1
-                    if stable >= 4:  # 400ms 연속 안정
+                    if stable >= 4:
                         break
                 else:
                     stable = 0
@@ -158,27 +167,33 @@ class ChapterDownloader:
                 time.sleep(0.1)
             time.sleep(0.2)
 
-            # 전체 페이지 스크린샷 (body 높이 = 콘텐츠 전체)
-            raw = page.screenshot(full_page=True)
-            full_img = PILImage.open(io.BytesIO(raw)).convert("RGB")
-            w, h = full_img.size
+            total_h = int(page.evaluate(
+                "() => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)"
+            ))
+            total_h = max(total_h, vp_h)
 
-            # CSS 주입 후에도 1뷰포트 높이면 → 스크롤 방식 폴백
-            if h <= vp_h + 50:
-                raw = self._scroll_capture(page, vp_h)
-                if raw:
-                    full_img = PILImage.open(io.BytesIO(raw)).convert("RGB")
-                    w, h = full_img.size
-
-            if h == 0:
-                return 0
+            # 맨 위에서 시작
+            page.evaluate("window.scrollTo(0, 0)")
+            time.sleep(0.2)
 
             images = []
-            y = 0
-            while y < h:
-                crop_h = min(vp_h, h - y)
-                images.append(full_img.crop((0, y, w, y + crop_h)))
-                y += vp_h
+            scroll_y = 0
+            MAX_PAGES = 500
+
+            while scroll_y < total_h and len(images) < MAX_PAGES:
+                page.evaluate(f"window.scrollTo(0, {scroll_y})")
+                time.sleep(0.25)
+                images.append(PILImage.open(io.BytesIO(page.screenshot(full_page=False))).convert("RGB"))
+                scroll_y += vp_h
+
+            # 마지막 부분 누락 방지: 실제 맨 아래 스크롤 후 추가 캡처
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            time.sleep(0.25)
+            last_img = PILImage.open(io.BytesIO(page.screenshot(full_page=False))).convert("RGB")
+            # 이전 프레임과 실제로 다를 때만 추가 (스크롤 위치 비교)
+            actual_bottom = page.evaluate("() => window.pageYOffset")
+            if not images or int(actual_bottom) > scroll_y - vp_h:
+                images.append(last_img)
 
             if not images:
                 return 0
@@ -195,75 +210,3 @@ class ChapterDownloader:
             except Exception:
                 pass
             return 1
-
-    def _scroll_capture(self, page, vp_h: int):
-        """CSS 주입이 실패했을 때 스크롤하며 스크린샷을 찍고 세로로 이어붙인다."""
-        try:
-            from PIL import Image as PILImage
-            import io as _io
-
-            # 스크롤 가능한 컨테이너 탐색 (overflow auto/scroll인 요소)
-            info = page.evaluate("""
-                () => {
-                    const ids = ['viewer_no_drag', 'novel_text', 'novel_box'];
-                    for (const id of ids) {
-                        const el = document.getElementById(id);
-                        if (!el) continue;
-                        const st = window.getComputedStyle(el);
-                        const ov = st.overflow + ' ' + st.overflowY;
-                        if ((ov.includes('auto') || ov.includes('scroll')) && el.scrollHeight > el.clientHeight + 50) {
-                            return { id, sh: el.scrollHeight };
-                        }
-                    }
-                    const winH = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
-                    return { id: '__window__', sh: winH };
-                }
-            """)
-            inner_id = info.get('id', '__window__')
-            total_h = max(int(info.get('sh', vp_h)), vp_h)
-
-            frames = []
-            scroll_y = 0
-            MAX_PAGES = 300
-
-            while scroll_y < total_h and len(frames) < MAX_PAGES:
-                if inner_id == '__window__':
-                    page.evaluate(f"window.scrollTo(0, {scroll_y})")
-                else:
-                    page.evaluate(
-                        f"(function(){{var e=document.getElementById('{inner_id}');if(e)e.scrollTop={scroll_y};}})()"
-                    )
-                time.sleep(0.3)
-                frames.append(PILImage.open(_io.BytesIO(page.screenshot(full_page=False))).convert("RGB"))
-                scroll_y += vp_h
-
-            # 마지막 부분 누락 방지: 실제 맨 아래로 스크롤 후 추가 캡처
-            if frames:
-                if inner_id == '__window__':
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                else:
-                    page.evaluate(
-                        f"(function(){{var e=document.getElementById('{inner_id}');if(e)e.scrollTop=e.scrollHeight;}})()"
-                    )
-                time.sleep(0.3)
-                last_frame = PILImage.open(_io.BytesIO(page.screenshot(full_page=False))).convert("RGB")
-                # 이전 마지막 프레임과 다를 때만 추가 (내용이 더 있는 경우)
-                if last_frame.tobytes() != frames[-1].tobytes():
-                    frames.append(last_frame)
-
-            if not frames:
-                return None
-
-            total_h_px = sum(f.size[1] for f in frames)
-            combined = PILImage.new("RGB", (frames[0].size[0], total_h_px))
-            y_off = 0
-            for f in frames:
-                combined.paste(f, (0, y_off))
-                y_off += f.size[1]
-
-            buf = _io.BytesIO()
-            combined.save(buf, "PNG")
-            return buf.getvalue()
-
-        except Exception:
-            return None

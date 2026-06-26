@@ -19,3 +19,8 @@ novels/
 
 # Docs/plans (개발 메모)
 docs/
+
+# PyInstaller 빌드 산출물
+build/
+dist/
+*.spec.bak
