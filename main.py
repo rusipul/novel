@@ -9,9 +9,6 @@ from downloader.scheduler import Scheduler
 from gui.login_window import LoginWindow
 from gui.main_window import MainWindow
 
-# 세션 쿠키 저장 경로 (홈 디렉터리)
-SESSION_FILE = str(Path.home() / ".novelpia_session.json")
-
 
 def main() -> None:
     # Playwright의 sync API는 생성된 스레드에서만 사용 가능.
@@ -22,8 +19,7 @@ def main() -> None:
 
     def _playwright_worker() -> None:
         session = BrowserSession(headless=False)
-        # 저장된 세션이 있으면 쿠키를 불러와 자동 로그인 시도
-        session.start(storage_state=SESSION_FILE if Path(SESSION_FILE).exists() else None)
+        session.start()
         _refs["client"] = NovelPiaClient(session)
         _refs["downloader"] = ChapterDownloader(session)
         _started.set()
@@ -63,6 +59,40 @@ def main() -> None:
 
     client = _refs["client"]
     downloader = _refs["downloader"]
+    login_refs: dict = {}
+    _login_ok = [False]
+
+    def handle_start_login() -> None:
+        # "① 네이버로 로그인" 버튼 클릭 시 — 브라우저를 열고 네이버 버튼을 클릭한다.
+        try:
+            _submit_sync(client.start_naver_login)
+            login_refs["win"].after(0, login_refs["win"].show_confirm_button)
+        except Exception as exc:
+            login_refs["win"].after(
+                0,
+                lambda msg=str(exc): login_refs["win"].show_error(f"브라우저 열기 실패: {msg}"),
+            )
+
+    def handle_confirm_login() -> None:
+        # "② 로그인 완료" 버튼 클릭 시 — 현재 URL로 로그인 여부를 확인한다.
+        try:
+            logged_in = _submit_sync(client.is_logged_in)
+        except Exception:
+            logged_in = False
+
+        if logged_in:
+            _login_ok[0] = True
+            # quit()은 mainloop를 멈추지만 창을 파괴하지 않음.
+            # 메인 스레드가 mainloop() 반환 후 다음 창을 직접 연다.
+            login_refs["win"].after(0, login_refs["win"].quit)
+        else:
+            login_refs["win"].after(
+                0,
+                lambda: login_refs["win"].show_error(
+                    "아직 로그인이 완료되지 않았습니다.\n"
+                    "자동으로 열린 Chromium 창에서 로그인을 완료한 뒤 다시 눌러주세요."
+                ),
+            )
 
     def on_search(query: str, search_type: str):
         return _submit_sync(lambda: client.search(query, search_type))
@@ -74,60 +104,12 @@ def main() -> None:
             )
         )
 
-    # 저장된 세션으로 자동 로그인 시도
-    if Path(SESSION_FILE).exists():
-        try:
-            auto_ok = _submit_sync(client.try_auto_login)
-        except Exception:
-            auto_ok = False
-        if auto_ok:
-            MainWindow(on_search=on_search, on_download=on_download).mainloop()
-            _task_q.put(None)
-            return
-
-    # 자동 로그인 실패 → 로그인 창 표시
-    login_refs: dict = {}
-    _login_ok = [False]
-
-    def handle_start_login() -> None:
-        try:
-            _submit_sync(client.start_naver_login)
-            login_refs["win"].after(0, login_refs["win"].show_confirm_button)
-        except Exception as exc:
-            login_refs["win"].after(
-                0,
-                lambda msg=str(exc): login_refs["win"].show_error(f"브라우저 열기 실패: {msg}"),
-            )
-
-    def handle_confirm_login() -> None:
-        try:
-            logged_in = _submit_sync(client.is_logged_in)
-        except Exception:
-            logged_in = False
-
-        if logged_in:
-            # 세션 쿠키 저장 → 다음 실행 시 자동 로그인
-            try:
-                _submit_sync(lambda: client.save_session(SESSION_FILE))
-            except Exception:
-                pass
-            _login_ok[0] = True
-            login_refs["win"].after(0, login_refs["win"].quit)
-        else:
-            login_refs["win"].after(
-                0,
-                lambda: login_refs["win"].show_error(
-                    "아직 로그인이 완료되지 않았습니다.\n"
-                    "자동으로 열린 Chromium 창에서 로그인을 완료한 뒤 다시 눌러주세요."
-                ),
-            )
-
     login_win = LoginWindow(
         on_naver_login=handle_start_login,
         on_login_confirm=handle_confirm_login,
     )
     login_refs["win"] = login_win
-    login_win.mainloop()
+    login_win.mainloop()  # 로그인 성공 시 quit()으로 여기서 반환됨
 
     if _login_ok[0]:
         login_win.destroy()
