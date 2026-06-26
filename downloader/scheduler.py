@@ -58,7 +58,53 @@ class Scheduler:
 
             time.sleep(self._delay)
 
+        # 모든 화 완료 후 통합 텍스트 파일 생성
+        self._merge_text(novel_name, chapters)
+
         return result
+
+    def _merge_text(self, novel_name: str, chapters: list) -> None:
+        """각 화의 text.txt를 화 번호 순으로 합쳐 전체본.txt를 생성한다."""
+        from storage.file_manager import _sanitize
+        novel_dir = self._base_dir / _sanitize(novel_name)
+        if not novel_dir.exists():
+            return
+
+        parts: list[tuple[int, str]] = []
+        for ch_dir in novel_dir.iterdir():
+            if not ch_dir.is_dir():
+                continue
+            txt = ch_dir / "text.txt"
+            if not txt.exists():
+                continue
+            # 폴더명 앞 숫자(화 번호)로 정렬
+            try:
+                num = int(ch_dir.name.split("_")[0])
+            except ValueError:
+                num = 9999
+            parts.append((num, txt.read_text(encoding="utf-8")))
+
+        if not parts:
+            return
+
+        parts.sort(key=lambda x: x[0])
+
+        merged_lines = []
+        for num, text in parts:
+            # 해당 화 번호의 제목 찾기
+            ch_title = next(
+                (c.title for c in chapters if c.chapter_num == num),
+                f"{num}화"
+            )
+            merged_lines.append(f"{'='*40}")
+            merged_lines.append(f"【{ch_title}】")
+            merged_lines.append(f"{'='*40}")
+            merged_lines.append(text)
+            merged_lines.append("")
+
+        (novel_dir / "전체본.txt").write_text(
+            "\n".join(merged_lines), encoding="utf-8"
+        )
 
     def _download_with_retry(self, chapter: ChapterInfo, novel_name: str) -> bool:
         for attempt in range(self._max_retries):

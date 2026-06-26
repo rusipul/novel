@@ -36,7 +36,10 @@ def chapter_exists(base_dir: Path, novel_name: str, chapter_num: int) -> bool:
 
 
 def _sanitize(name: str) -> str:
+    name = name.replace("\n", " ").replace("\r", "").replace("\t", " ")
     for ch in r'\/:*?"<>|':
         name = name.replace(ch, "_")
-    name = name.strip()
+    while "  " in name:
+        name = name.replace("  ", " ")
+    name = name.strip()[:80].strip()
     return name if name else "unnamed"

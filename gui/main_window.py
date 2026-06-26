@@ -79,13 +79,16 @@ class MainWindow(tk.Tk):
             return
         self._status_label.config(text="검색 중...")
         self.update()
-        self._novels = self._on_search(query, self._search_type.get())
+        try:
+            self._novels = self._on_search(query, self._search_type.get())
+        except Exception as exc:
+            self._status_label.config(text=f"검색 실패: {exc}", foreground="red")
+            return
         self._listbox.delete(0, "end")
         for novel in self._novels:
             status = "구독중" if novel.is_subscribed else "미구독"
             self._listbox.insert("end", f"[{status}] {novel.title}  — {novel.author}")
-        self._status_label.config(text=f"검색 결과: {len(self._novels)}건")
-        self._dl_btn.config(state="disabled")
+        self._status_label.config(text=f"검색 결과: {len(self._novels)}건", foreground="")
 
     def _on_select(self, _event) -> None:
         idx = self._listbox.curselection()
@@ -110,9 +113,9 @@ class MainWindow(tk.Tk):
         self._progress["value"] = 0
 
         def progress_cb(current: int, total: int, title: str) -> None:
-            self._progress["value"] = (current / total * 100) if total else 0
-            self._status_label.config(text=f"{current}/{total}화 — {title}")
-            self.update_idletasks()
+            pct = (current / total * 100) if total else 0
+            self.after(0, lambda: self._progress.configure(value=pct))
+            self.after(0, lambda: self._status_label.config(text=f"{current}/{total}화 — {title}"))
 
         def run() -> None:
             self._on_download(novel.novel_id, novel.title, base_dir, progress_cb)

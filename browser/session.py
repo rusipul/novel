@@ -21,6 +21,14 @@ class BrowserSession:
             ),
         )
         self._page = self._context.new_page()
+        # JS alert/confirm/prompt를 브라우저 레벨에서 무음 처리.
+        # page.on("dialog", ...) 핸들러 안에서 sync API를 호출하면 greenlet 충돌이 발생하므로
+        # init_script로 window.alert 자체를 덮어써서 dialog 이벤트가 아예 발생하지 않게 한다.
+        self._page.add_init_script(
+            "window.alert = () => {};"
+            "window.confirm = () => true;"
+            "window.prompt = () => '';"
+        )
 
     def stop(self) -> None:
         if self._context:

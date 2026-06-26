@@ -47,63 +47,194 @@ class NovelPiaClient:
         page.wait_for_load_state("networkidle")
         return "/login" not in page.url
 
-    def login_naver(self, timeout_ms: int = 300_000) -> bool:
+    def start_naver_login(self) -> None:
+        """로그인 페이지로 이동하고 네이버 버튼 클릭을 시도한다."""
         page = self._session.page
         page.goto(f"{BASE_URL}/login")
-        page.wait_for_load_state("networkidle")
-
-        naver_btn = page.query_selector(self.SEL_NAVER_BTN)
-        if not naver_btn:
-            return False
-        naver_btn.click()
-
-        # 사용자가 네이버 OAuth를 완료할 때까지 대기 (최대 timeout_ms)
         try:
-            page.wait_for_url(
-                lambda url: "novelpia.com" in url and "/login" not in url,
-                timeout=timeout_ms,
-            )
-            return True
+            page.wait_for_load_state("domcontentloaded", timeout=15_000)
+        except Exception:
+            pass
+        try:
+            page.click(self.SEL_NAVER_BTN, timeout=5_000)
+        except Exception:
+            pass  # 버튼을 못 찾아도 사용자가 브라우저에서 직접 클릭 가능
+
+    def is_logged_in(self) -> bool:
+        """로그인 여부를 확인한다.
+        노벨피아는 SPA — 네이버 OAuth 완료 후에도 URL이 /login에 머무름.
+        로그인 폼(비밀번호 입력창)이 사라졌으면 로그인 성공으로 판단."""
+        try:
+            page = self._session.page
+            url = page.url
+            if "novelpia.com" not in url:
+                return False
+            if "/login" not in url:
+                return True
+            # SPA: URL이 /login이어도 폼이 없으면 로그인 완료
+            login_form = page.query_selector("input[type='password'], .login-form, #login-form")
+            return login_form is None
         except Exception:
             return False
 
+    def login_naver(self, timeout_ms: int = 300_000) -> bool:
+        """자동 폴링 방식 로그인 (하위 호환 유지)."""
+        import time as _time
+        self.start_naver_login()
+        deadline = _time.time() + timeout_ms / 1000
+        while _time.time() < deadline:
+            if self.is_logged_in():
+                return True
+            _time.sleep(1)
+        return False
+
     def search(self, query: str, search_type: str = "title") -> list[NovelInfo]:
-        type_param = {"title": "novel", "author": "author", "tag": "tag"}.get(search_type, "novel")
+        from urllib.parse import quote
+        encoded = quote(query)
+        url = (
+            f"{BASE_URL}/search/all//1/{encoded}"
+            "?page=1&rows=30&novel_type=&sort_col=last_viewdate"
+            "&block_out=0&block_stop=0&is_contest=0&is_challenge=0&list_display=list"
+        )
         page = self._session.page
-        page.goto(f"{BASE_URL}/novel?search={query}&searchType={type_param}")
-        page.wait_for_load_state("networkidle")
-        results = []
-        for item in page.query_selector_all(self.SEL_NOVEL_ITEM):
-            title_el = item.query_selector(self.SEL_NOVEL_TITLE)
-            link_el = item.query_selector("a[href*='/novel/']")
-            if not title_el or not link_el:
-                continue
-            author_el = item.query_selector(self.SEL_NOVEL_AUTHOR)
-            badge_el = item.query_selector(self.SEL_SUBSCRIPTION_BADGE)
-            href = link_el.get_attribute("href") or ""
-            novel_id = href.split("/novel/")[-1].split("/")[0].split("?")[0]
-            results.append(NovelInfo(
-                novel_id=novel_id,
-                title=title_el.inner_text().strip(),
-                author=author_el.inner_text().strip() if author_el else "",
-                is_subscribed=badge_el is not None,
-            ))
-        return results
+
+        # 전략 1: goto(commit) — URL이 커밋되면 즉시 반환, 로드 완료를 기다리지 않음
+        try:
+            page.goto(url, wait_until="commit", timeout=15_000)
+        except Exception:
+            # 전략 2: JS 네비게이션 — "context was destroyed"는 네비게이션 중 정상 발생
+            try:
+                page.evaluate("u => { window.location.href = u; }", url)
+            except Exception:
+                pass
+
+        # 어떤 방법으로든 네비게이션이 시작됐으면 로드 완료 대기
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=20_000)
+        except Exception:
+            pass
+        try:
+            page.wait_for_load_state("networkidle", timeout=8_000)
+        except Exception:
+            pass
+
+        # CSS 선택자 대신 JS로 /novel/{id} 링크를 직접 추출 — 실제 HTML 구조에 독립적
+        try:
+            raw: list[dict] = page.evaluate("""
+                () => {
+                    const seen = new Set();
+                    const results = [];
+                    document.querySelectorAll('a[href]').forEach(a => {
+                        const m = a.href.match(/\\/novel\\/(\\d+)/);
+                        if (!m || seen.has(m[1])) return;
+                        seen.add(m[1]);
+                        // 줄바꿈→공백, 3칸 이상→2칸(구분자 보존), trim 후 첫 2칸 앞까지만 제목
+                        const raw = a.textContent.replace(/[\\n\\r\\t]/g, ' ').replace(/ {3,}/g, '  ');
+                        const trimmed = raw.trim();
+                        const spIdx = trimmed.search(/ {2,}/);
+                        const title = (spIdx > 0 ? trimmed.slice(0, spIdx) : trimmed).slice(0, 80);
+                        let author = '';
+                        const card = a.closest('li, tr, article, .item') || a.parentElement;
+                        if (card) {
+                            card.querySelectorAll('[class*="author"], [class*="writer"], [class*="nick"]')
+                                .forEach(el => {
+                                    const t = el.textContent.trim();
+                                    if (t && t.length < 30) author = t;
+                                });
+                        }
+                        if (title) results.push({ id: m[1], title, author });
+                    });
+                    return results;
+                }
+            """) or []
+        except Exception:
+            raw = []
+
+        return [
+            NovelInfo(
+                novel_id=item["id"],
+                title=item["title"],
+                author=item.get("author", ""),
+                is_subscribed=True,  # TODO: HTML 구조 파악 후 실제 구독 배지로 대체
+            )
+            for item in raw
+            if item.get("title")
+        ]
 
     def get_chapter_list(self, novel_id: str) -> list[ChapterInfo]:
         page = self._session.page
-        page.goto(f"{BASE_URL}/novel/{novel_id}")
-        page.wait_for_load_state("networkidle")
-        chapters = []
-        for i, row in enumerate(page.query_selector_all(self.SEL_CHAPTER_ROW), start=1):
-            title_el = row.query_selector(self.SEL_CHAPTER_TITLE)
-            link_el = row.query_selector("a[href*='/viewer/']")
-            if not title_el or not link_el:
-                continue
-            href = link_el.get_attribute("href") or ""
-            url = href if href.startswith("http") else f"{BASE_URL}{href}"
-            chapters.append(ChapterInfo(chapter_num=i, title=title_el.inner_text().strip(), url=url))
-        return chapters
+        url = f"{BASE_URL}/novel/{novel_id}"
+
+        try:
+            page.goto(url, wait_until="commit", timeout=15_000)
+        except Exception:
+            try:
+                page.evaluate("u => { window.location.href = u; }", url)
+            except Exception:
+                pass
+
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=15_000)
+        except Exception:
+            pass
+        try:
+            page.wait_for_load_state("networkidle", timeout=8_000)
+        except Exception:
+            pass
+
+        # JS로 /viewer/ 링크를 직접 추출 — CSS 선택자보다 HTML 구조에 독립적
+        try:
+            raw: list[dict] = page.evaluate("""
+                () => {
+                    const seen = new Set();
+                    const results = [];
+                    document.querySelectorAll('a[href]').forEach(a => {
+                        if (!a.href.includes('/viewer/')) return;
+                        if (seen.has(a.href)) return;
+                        seen.add(a.href);
+
+                        // 부모 카드에서 제목 요소 탐색
+                        let title = '';
+                        const card = a.closest('li, tr, .item, .episode-item') || a.parentElement;
+                        if (card) {
+                            const titleEl = card.querySelector(
+                                '[class*="title"], [class*="ep_title"], [class*="episode_title"],'
+                                + '[class*="ep-title"], [class*="subject"], .s_inv_bold'
+                            );
+                            if (titleEl) title = titleEl.textContent.trim().slice(0, 60);
+                        }
+
+                        // 제목 없으면 링크 텍스트에서 N화 패턴 추출
+                        if (!title) {
+                            const raw = a.textContent.replace(/[\\n\\r\\t]/g, ' ').trim();
+                            const m = raw.match(/\\d+\\s*화/);
+                            title = m ? m[0].replace(/\\s+/g, '') : raw.slice(0, 60);
+                        }
+
+                        results.push({ url: a.href, title });
+                    });
+                    return results;
+                }
+            """) or []
+        except Exception:
+            raw = []
+
+        import re as _re
+
+        def _ep_num(item: dict) -> int:
+            m = _re.search(r"(\d+)화", item.get("title", ""))
+            return int(m.group(1)) if m else 9999
+
+        raw.sort(key=_ep_num)
+
+        return [
+            ChapterInfo(
+                chapter_num=_ep_num(item) if _ep_num(item) != 9999 else i + 1,
+                title=item.get("title", f"{i + 1}화") or f"{i + 1}화",
+                url=item["url"],
+            )
+            for i, item in enumerate(raw)
+        ]
 
     def relogin(self) -> bool:
         if self._credentials:

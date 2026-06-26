@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# Playwright
+playwright/.auth/
+
+# Logs / output
+*.log
+*.output
+bppbmazby.output
+
+# Downloads (실제 소설 파일)
+novels/
+
+# Docs/plans (개발 메모)
+docs/
