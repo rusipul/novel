@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 다운로드된 소설 데이터 (대용량)
+novels/
+
+# 로그 / 임시
+*.log
+*.tmp
+error_log*.txt
